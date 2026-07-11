@@ -8,9 +8,9 @@ WITHOUT using the Telegram API.
 
 Two data sources (both are plain web scraping):
 
-  1. "tgstat"  -> https://tgstat.com/channel/@<channel>   (default, per request)
-  2. "tme"     -> https://t.me/s/<channel>                (Telegram web preview,
-                                                           very reliable fallback)
+1. "tgstat"  ->  https://tgstat.com/channel/@<channel>   (default, per request)
+2. "tme"     ->  https://t.me/s/<channel>                (Telegram web preview,
+                                                          very reliable fallback)
 
 If tgstat blocks the request (captcha / 403 — it is quite aggressive with
 bots), the script automatically falls back to the t.me web preview, which
@@ -23,7 +23,8 @@ Usage
     python tg_channel_export.py irancurrency --from 2026-06-01 --to 2026-06-30 --source tme
 
 Output CSV columns:
-    message_id, datetime_utc, text, views, link
+    message_id, datetime_utc, text, views, is_forwarded,
+    forwarded_from, forwarded_from_link, forwards, link
 """
 
 import argparse
@@ -58,8 +59,9 @@ _DIGIT_MAP = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567
 def parse_user_date(s: str) -> datetime:
     """
     Accept a date in YYYY-MM-DD (or YYYY/MM/DD) form, in either Gregorian
-    or Jalali (Shamsi) calendar. Years below 1700 are treated as Jalali
-    (e.g. 1405-04-15). Persian digits are accepted too.
+    or Jalali (Shamsi) calendar.  Years below 1700 are treated as Jalali
+    (e.g. 1405-04-15).  Persian digits are accepted too.
+
     Returns a UTC-aware datetime at 00:00.
     """
     s = s.strip().translate(_DIGIT_MAP).replace("/", "-").replace(".", "-")
@@ -78,7 +80,7 @@ def parse_user_date(s: str) -> datetime:
 
 
 # --------------------------------------------------------------------------- #
-# Helpers
+#  Helpers
 # --------------------------------------------------------------------------- #
 def normalize_channel(raw: str) -> str:
     """Accept 'irancurrency', '@irancurrency' or a full t.me / tgstat URL."""
@@ -90,7 +92,7 @@ def normalize_channel(raw: str) -> str:
 
 
 def parse_views(s: str):
-    """'12.3K' -> 12300, '1.1M' -> 1100000, '532' -> 532."""
+    """'12.3K' -> 12300,  '1.1M' -> 1100000,  '532' -> 532."""
     if not s:
         return None
     s = s.strip().replace(",", "").replace("\u202f", "").replace(" ", "")
@@ -110,8 +112,30 @@ def clean_text(el) -> str:
     return el.get_text("\n", strip=True) if el else ""
 
 
+def parse_forwarded_tme(msg):
+    """
+    NEW: detect whether a t.me post is a forward (re-share) and from where.
+
+    In the t.me/s/ HTML, forwarded posts contain:
+        <a class="tgme_widget_message_forwarded_from_name" href="...">NAME</a>
+    (or a <span> with the same class when the source is hidden/private).
+
+    Returns (is_forwarded, forwarded_from, forwarded_from_link).
+    """
+    el = msg.select_one(
+        ".tgme_widget_message_forwarded_from_name, "
+        ".tgme_widget_message_forwarded_from a, "
+        ".tgme_widget_message_forwarded_from span"
+    )
+    if el is None:
+        return 0, "", ""
+    name = clean_text(el)
+    link = el.get("href", "") if el.name == "a" else ""
+    return 1, name, link
+
+
 # --------------------------------------------------------------------------- #
-# Source 1: t.me/s/<channel>  (Telegram public web preview)
+#  Source 1:  t.me/s/<channel>   (Telegram public web preview)
 # --------------------------------------------------------------------------- #
 def fetch_tme(channel: str, date_from: datetime, date_to: datetime,
               delay: float = 1.0, max_pages: int = 2000, log=_log_stderr):
@@ -122,6 +146,7 @@ def fetch_tme(channel: str, date_from: datetime, date_to: datetime,
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT,
                             "Accept-Language": "en-US,en;q=0.9"})
+
     posts = {}
     before = None
 
@@ -149,7 +174,7 @@ def fetch_tme(channel: str, date_from: datetime, date_to: datetime,
         if not messages:
             if page == 0:
                 raise RuntimeError(
-                    "No posts found. The channel may be private, "
+                    "No posts found.  The channel may be private, "
                     "restricted, or the username is wrong."
                 )
             break
@@ -180,11 +205,19 @@ def fetch_tme(channel: str, date_from: datetime, date_to: datetime,
             views = parse_views(
                 clean_text(msg.select_one(".tgme_widget_message_views"))
             )
+
+            # NEW: forwarded (re-shared) post detection
+            is_fwd, fwd_from, fwd_link = parse_forwarded_tme(msg)
+
             posts[msg_id] = {
                 "message_id": msg_id,
                 "datetime_utc": dt_utc.strftime("%Y-%m-%d %H:%M:%S"),
                 "text": text,
                 "views": views if views is not None else "",
+                "is_forwarded": is_fwd,
+                "forwarded_from": fwd_from,
+                "forwarded_from_link": fwd_link,
+                "forwards": "",  # t.me preview does not expose forward counts
                 "link": f"https://t.me/{channel}/{msg_id}",
             }
 
@@ -199,7 +232,7 @@ def fetch_tme(channel: str, date_from: datetime, date_to: datetime,
 
 
 # --------------------------------------------------------------------------- #
-# Source 2: tgstat.com
+#  Source 2:  tgstat.com
 # --------------------------------------------------------------------------- #
 _TGSTAT_DATE_FORMATS = ("%d %b %Y, %H:%M", "%d %b, %H:%M",
                         "%d.%m.%Y %H:%M", "%d.%m.%Y")
@@ -221,13 +254,50 @@ def _parse_tgstat_date(text: str):
     return None
 
 
+def _parse_tgstat_forward(card):
+    """
+    NEW: best-effort detection of 'Forwarded from ...' on a tgstat post card.
+    Returns (is_forwarded, forwarded_from, forwarded_from_link).
+    """
+    node = card.find(string=re.compile(r"forwarded\s+from|репост|بازارسال", re.I))
+    if node is None:
+        return 0, "", ""
+    parent = node.parent
+    a = None
+    if parent is not None:
+        a = parent.find("a") or (parent.parent.find("a") if parent.parent else None)
+    if a is not None:
+        return 1, clean_text(a), a.get("href", "")
+    # forwarded, but source name/link not parseable
+    return 1, re.sub(r"(?i)forwarded\s+from", "", str(node)).strip(), ""
+
+
+def _parse_tgstat_shares(card):
+    """
+    NEW: best-effort extraction of the forwards/shares counter on tgstat.
+    Returns an int or None.
+    """
+    el = card.select_one(".post-shares, [data-shares], .post-forwards")
+    if el is not None:
+        v = parse_views(el.get_text(strip=True))
+        if v is not None:
+            return v
+    node = card.find(string=re.compile(r"shares?|forwards?", re.I))
+    if node is not None and node.parent is not None:
+        m = re.search(r"([\d.,]+\s*[KkMm]?)",
+                      node.parent.get_text(" ", strip=True))
+        if m:
+            return parse_views(m.group(1))
+    return None
+
+
 def _parse_tgstat_posts(soup, channel: str):
     """Best-effort parsing of tgstat post cards."""
     out = {}
     for card in soup.select("div.post-container, div[id^=post-]"):
         msg_id = None
         link_el = card.select_one(f'a[href*="t.me/{channel}/"]') or \
-                  card.select_one(f'a[href*="/channel/@{channel}/"]')
+            card.select_one(f'a[href*="/channel/@{channel}/"]')
         if link_el:
             m = re.search(r"/(\d+)(?:\D|$)", link_el.get("href", ""))
             if m:
@@ -246,6 +316,7 @@ def _parse_tgstat_posts(soup, channel: str):
                 break
 
         text_el = card.select_one(".post-text, .post-body, .text")
+
         views = None
         views_el = card.find(string=re.compile(r"views", re.I))
         if views_el is None:
@@ -253,11 +324,19 @@ def _parse_tgstat_posts(soup, channel: str):
             if v:
                 views = parse_views(v.get_text(strip=True))
 
+        # NEW: forwarded-from + shares counter (best effort)
+        is_fwd, fwd_from, fwd_link = _parse_tgstat_forward(card)
+        shares = _parse_tgstat_shares(card)
+
         out[msg_id] = {
             "message_id": msg_id,
             "datetime": dt,
             "text": clean_text(text_el) or clean_text(card),
             "views": views if views is not None else "",
+            "is_forwarded": is_fwd,
+            "forwarded_from": fwd_from,
+            "forwarded_from_link": fwd_link,
+            "forwards": shares if shares is not None else "",
             "link": f"https://t.me/{channel}/{msg_id}",
         }
     return out
@@ -268,7 +347,7 @@ def fetch_tgstat(channel: str, date_from: datetime, date_to: datetime,
                  max_pages: int = 300, log=_log_stderr):
     """
     Scrape post cards from tgstat channel page + its AJAX 'load more'
-    endpoint. tgstat is protected against bots, so this may raise —
+    endpoint.  tgstat is protected against bots, so this may raise —
     the caller then falls back to the t.me preview.
     """
     session = requests.Session()
@@ -292,7 +371,6 @@ def fetch_tgstat(channel: str, date_from: datetime, date_to: datetime,
         raise RuntimeError("Could not parse any posts from the tgstat page")
 
     csrf = session.cookies.get("_tgstat_csrk", "")
-
     covered = False    # did we paginate back past date_from?
     exhausted = False  # did we reach the very beginning of the channel?
 
@@ -315,6 +393,7 @@ def fetch_tgstat(channel: str, date_from: datetime, date_to: datetime,
             html = payload.get("html", "")
         except Exception:
             break  # AJAX endpoint changed/blocked -> incomplete coverage
+
         if not html.strip():
             exhausted = True  # no more posts: reached channel beginning
             break
@@ -330,7 +409,7 @@ def fetch_tgstat(channel: str, date_from: datetime, date_to: datetime,
 
     # CRITICAL: if we could not paginate back past the start date and the
     # channel wasn't exhausted, coverage is INCOMPLETE (this is what caused
-    # the "only 20 posts" bug). Raise so the caller falls back to t.me,
+    # the "only 20 posts" bug).  Raise so the caller falls back to t.me,
     # which paginates reliably over the whole range.
     if not covered and not exhausted:
         raise RuntimeError(
@@ -348,18 +427,25 @@ def fetch_tgstat(channel: str, date_from: datetime, date_to: datetime,
             "datetime_utc": dt.strftime("%Y-%m-%d %H:%M:%S"),
             "text": p["text"],
             "views": p["views"],
+            "is_forwarded": p["is_forwarded"],
+            "forwarded_from": p["forwarded_from"],
+            "forwarded_from_link": p["forwarded_from_link"],
+            "forwards": p["forwards"],
             "link": p["link"],
         })
+
     if not posts:
         raise RuntimeError("tgstat parsing yielded no posts inside the date range")
     return posts
 
 
 # --------------------------------------------------------------------------- #
-# CSV writer
+#  CSV writer
 # --------------------------------------------------------------------------- #
 def write_csv(posts, path: str):
-    fields = ["message_id", "datetime_utc", "text", "views", "link"]
+    fields = ["message_id", "datetime_utc", "text", "views",
+              "is_forwarded", "forwarded_from", "forwarded_from_link",
+              "forwards", "link"]
     # utf-8-sig so Excel opens Persian text correctly
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -368,7 +454,7 @@ def write_csv(posts, path: str):
 
 
 # --------------------------------------------------------------------------- #
-# High-level API (used by CLI and the GUI)
+#  High-level API (used by CLI and the GUI)
 # --------------------------------------------------------------------------- #
 def export_posts(channel, date_from, date_to, source="tgstat",
                  domain="tgstat.com", delay=1.0, log=_log_stderr):
@@ -387,18 +473,21 @@ def export_posts(channel, date_from, date_to, source="tgstat",
         except Exception as e:
             log(f"tgstat جواب نداد ({e})")
             log("رفتیم سراغ پیش‌نمایش وب تلگرام (t.me) ...")
+
     if posts is None:
         posts = fetch_tme(channel, date_from, date_to, delay=delay, log=log)
+
     return channel, posts
 
 
 # --------------------------------------------------------------------------- #
-# Interactive mode (no arguments given)
+#  Interactive mode (no arguments given)
 # --------------------------------------------------------------------------- #
 def interactive_main():
     print("=" * 52)
-    print("   استخراج پست‌های کانال تلگرام → فایل CSV")
+    print("   استخراج پست‌های کانال تلگرام  →  فایل CSV")
     print("=" * 52)
+
     channel = input("\nنام یا لینک کانال (مثلاً irancurrency): ").strip()
     while not channel:
         channel = input("نام کانال نمی‌تواند خالی باشد. دوباره وارد کنید: ").strip()
@@ -416,6 +505,7 @@ def interactive_main():
 
     out = input("نام فایل خروجی [Enter = پیش‌فرض]: ").strip()
     print()
+
     try:
         channel, posts = export_posts(channel, date_from, date_to, log=print)
     except Exception as e:
@@ -433,12 +523,13 @@ def interactive_main():
 
 
 # --------------------------------------------------------------------------- #
-# Main
+#  Main
 # --------------------------------------------------------------------------- #
 def main():
-    if len(sys.argv) == 1:          # no arguments -> friendly interactive mode
+    if len(sys.argv) == 1:  # no arguments -> friendly interactive mode
         interactive_main()
         return
+
     ap = argparse.ArgumentParser(
         description="Export public Telegram channel posts between two dates "
                     "to CSV (no Telegram API needed).")
