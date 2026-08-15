@@ -185,4 +185,7 @@ jdatetime
 
 MIT License
 
-قبل از انتشار، در فایل `LICENSE` عبارت `YOUR NAME` را با نام خودتان یا نام GitHub خودتان جایگزین کنید.
+## Web Interface
+A modern web-based preview of this tool is also available. You can export channel posts directly from your browser.
+
+For technical details, local setup, and architecture, please visit the `/web` directory.
